@@ -1,0 +1,20 @@
+# Environments
+venv/
+env/
+.env
+
+# Local Databases
+rag_lancedb/
+rag_db/
+
+# Temporary Uploads
+temp_uploads/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Mac OS junk (just in case)
+.DS_Store
