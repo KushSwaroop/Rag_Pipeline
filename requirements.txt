@@ -1,0 +1,14 @@
+streamlit
+fastapi
+uvicorn[standard]
+pydantic
+httpx
+lancedb
+pypdf
+openpyxl
+pytesseract
+pillow
+openai-whisper
+ffmpeg-python
+pdfplumber
+python-multipart

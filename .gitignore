@@ -1,20 +1,44 @@
-# Environments
+# Virtual environments
 venv/
 env/
 .env
+.venv
+Include/
+Lib/
+Scripts/
+share/
+etc/
+pyvenv.cfg
 
-# Local Databases
-rag_lancedb/
-rag_db/
-
-# Temporary Uploads
-temp_uploads/
-
-# Python Cache
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Mac OS junk (just in case)
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# Database files (if local)
+*.db
+rag_lancedb/
+rag_db/
+
+# User data
+data/user/
+uploads/
+temp_uploads/
+*.pdf
+*.csv
+*.xlsx
+
+# Environment variables
+.env
+
+# OS junk
 .DS_Store
+Thumbs.dbDATA/
+scratch/
+datascraper.py

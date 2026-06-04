@@ -1,35 +1,32 @@
 import lancedb
 from pypdf import PdfReader
+import pdfplumber
 import httpx
 import os
 import csv
 import time
+import re
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Initialize local LanceDB (This creates a 'rag_lancedb' folder in your project)
+# Initialize local LanceDB
 db = lancedb.connect("./rag_lancedb")
 TABLE_NAME = "documents"
 DATA_DIR = Path(__file__).parent / "DATA"
 
-# Maximum rows to ingest from large CSV/XLSX files (prevents memory issues)
 MAX_CSV_ROWS = 5000
-# Max file size to process (in MB) -- skip massive raw data files
 MAX_INGEST_SIZE_MB = 50
 
-
+# -----------------------------------------------------------------
+# EMBEDDINGS (BATCH API)
+# -----------------------------------------------------------------
 def get_embedding(text: str, client: httpx.Client = None) -> list:
-    """Calls local Ollama to convert text into a searchable vector array.
-    
-    Includes a retry mechanism to handle local server cold starts or resource queuing errors.
-    """
     url = "http://127.0.0.1:11434/api/embeddings"
     json_data = {"model": "nomic-embed-text", "prompt": text}
     
     for attempt in range(5):
         try:
             if client:
-                response = client.post(url, json=json_data)
+                response = client.post(url, json=json_data, timeout=30.0)
             else:
                 with httpx.Client(timeout=30.0) as c:
                     response = c.post(url, json=json_data)
@@ -37,20 +34,41 @@ def get_embedding(text: str, client: httpx.Client = None) -> list:
             return response.json()["embedding"]
         except Exception as e:
             if attempt < 4:
-                # Sleep and retry to allow Ollama server model runners to spin up
                 time.sleep(1.0 * (attempt + 1))
                 continue
             else:
                 print(f"Embedding error: {e}")
                 return []
 
-
-def chunk_text(text: str, chunk_size: int = 700, overlap: int = 150) -> list:
-    """Slices a massive text wall into overlapping readable chunks.
+def get_embeddings_batch(texts: list, client: httpx.Client = None) -> list:
+    """Calls local Ollama /api/embed to process up to 100 texts at once using GPU."""
+    url = "http://127.0.0.1:11434/api/embed"
+    inputs = [f"search_document: {t}" for t in texts]
+    json_data = {"model": "nomic-embed-text", "input": inputs}
     
-    Defaults to 700 characters to keep token count safely under Ollama's 512-token batch limit 
-    for nomic-embed-text (especially for non-English languages like German).
-    """
+    for attempt in range(5):
+        try:
+            if client:
+                response = client.post(url, json=json_data, timeout=300.0)
+            else:
+                with httpx.Client(timeout=300.0) as c:
+                    response = c.post(url, json=json_data)
+            response.raise_for_status()
+            return response.json()["embeddings"]
+        except Exception as e:
+            if attempt < 4:
+                print(f"Batch embed retry {attempt+1}... {e}")
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            else:
+                print(f"Batch embedding error: {e}")
+                return []
+
+# -----------------------------------------------------------------
+# CHUNKING LOGIC
+# -----------------------------------------------------------------
+def chunk_text(text: str, chunk_size: int = 700, overlap: int = 150) -> list:
+    """Generic fallback string chunker."""
     chunks = []
     start = 0
     while start < len(text):
@@ -59,199 +77,158 @@ def chunk_text(text: str, chunk_size: int = 700, overlap: int = 150) -> list:
         start += chunk_size - overlap
     return chunks
 
-
-# -----------------------------------------------------------------
-# TEXT EXTRACTORS (one per file type)
-# -----------------------------------------------------------------
-def extract_text_from_pdf(file_path: str) -> str:
-    """Extract all text from a PDF file."""
-    reader = PdfReader(file_path)
-    full_text = ""
-    for page in reader.pages:
-        extracted = page.extract_text()
-        if extracted:
-            full_text += extracted + "\n"
-    return full_text
-
-
-def extract_text_from_csv(file_path: str) -> str:
-    """Convert CSV rows into readable text for embedding.
-    
-    Strategy: convert each row into a 'Column: Value' format so the
-    embeddings capture the semantic meaning of column headers + data.
-    """
-    text_parts = []
+def chunk_gov_csv(file_path: str, filename: str) -> list:
+    """Strategy: row-group by topic, 50-100 rows, overlap 10 rows."""
+    chunks = []
     try:
-        # Try utf-8 first, fall back to latin-1
-        for encoding in ["utf-8", "latin-1", "cp1252"]:
-            try:
-                with open(file_path, "r", encoding=encoding, errors="replace") as f:
-                    reader = csv.reader(f)
-                    headers = next(reader, None)
-                    if not headers:
-                        return ""
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            reader = csv.reader(f)
+            headers = next(reader, None)
+            if not headers: return []
+            
+            rows = []
+            for row in reader:
+                if len(rows) > MAX_CSV_ROWS: break
+                rows.append(row)
+                
+            chunk_size = 80  # Between 50-100
+            overlap = 10
+            start = 0
+            while start < len(rows):
+                end = start + chunk_size
+                batch_rows = rows[start:end]
+                
+                chunk_text_str = f"Population data for Olpe, Germany (Source: {filename}):\n"
+                for r in batch_rows:
+                    pairs = [f"{h}: {v}" for h, v in zip(headers, r) if str(v).strip()]
+                    chunk_text_str += " | ".join(pairs) + "\n"
+                
+                chunks.append(chunk_text_str)
+                start += chunk_size - overlap
+    except Exception as e:
+        print(f"  CSV error: {e}")
+    return chunks
+
+def chunk_mixed_gov_pdf(file_path: str, filename: str) -> list:
+    """Strategy: Extract tables to structured text markdown, 1 table per chunk."""
+    chunks = []
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            # Safety: skip table extraction on massive documents
+            skip_tables = len(pdf.pages) > 100
+            if skip_tables:
+                print(f"    [WARN] Document has {len(pdf.pages)} pages. Skipping slow table extraction.")
+                
+            for page in pdf.pages:
+                if not skip_tables:
+                    tables = page.extract_tables()
+                    for table in tables:
+                        md = f"Data table from city of Olpe (Source: {filename}):\n"
+                        for i, row in enumerate(table):
+                            clean_row = [str(c).replace('\n', ' ') if c else '' for c in row]
+                            md += "| " + " | ".join(clean_row) + " |\n"
+                            if i == 0:
+                                md += "|" + "|".join(["---"] * len(clean_row)) + "|\n"
+                        chunks.append(md)
+                
+                text = page.extract_text()
+                if text and len(text) > 50:
+                    chunks.extend(chunk_text(text, 1000, 200))
+    except Exception as e:
+        print(f"  PDF Table extraction error: {e}")
+    return chunks
+
+def chunk_presentation(file_path: str, filename: str) -> list:
+    """Strategy: Slide-based, whole slide = 1 chunk, no overlap."""
+    chunks = []
+    try:
+        reader = PdfReader(file_path)
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
+            if text and len(text.strip()) > 10:
+                chunks.append(f"[Slide {i+1} | {filename}]\n{text}")
+    except Exception as e:
+        print(f"  Presentation extraction error: {e}")
+    return chunks
+
+def chunk_report(file_path: str, filename: str) -> list:
+    """Strategy: Section-based, 1-3 paragraphs per section."""
+    chunks = []
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text: full_text += text + "\n\n"
                     
-                    row_count = 0
-                    for row in reader:
-                        if row_count >= MAX_CSV_ROWS:
-                            text_parts.append(f"[... truncated at {MAX_CSV_ROWS} rows ...]")
-                            break
-                        # Format: "Column1: val1, Column2: val2, ..."
-                        pairs = []
-                        for h, v in zip(headers, row):
-                            if v.strip():
-                                pairs.append(f"{h}: {v}")
-                        if pairs:
-                            text_parts.append(", ".join(pairs))
-                        row_count += 1
-                    break  # encoding worked, stop trying
-            except UnicodeDecodeError:
-                continue
+            paragraphs = [p.strip() for p in full_text.split("\n\n") if len(p.strip()) > 20]
+            
+            start = 0
+            while start < len(paragraphs):
+                group = paragraphs[start:start+3]
+                chunks.append(f"Section from {filename}:\n" + "\n\n".join(group))
+                start += 2 # Overlap by 1 paragraph
     except Exception as e:
-        print(f"  CSV read error: {e}")
-        return ""
-    
-    return "\n".join(text_parts)
+        print(f"  Report extraction error: {e}")
+    return chunks
 
-
-def extract_text_from_xlsx(file_path: str) -> str:
-    """Convert XLSX spreadsheet rows into readable text for embedding."""
+def chunk_paper(file_path: str, filename: str) -> list:
+    """Strategy: Semantic + structural. Preserve abstract, split by headers."""
+    chunks = []
     try:
-        import openpyxl
-    except ImportError:
-        print("  openpyxl not installed -- skipping XLSX file")
-        return ""
-    
-    text_parts = []
-    try:
-        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            
-            row_iter = ws.iter_rows(values_only=True)
-            try:
-                first_row = next(row_iter)
-            except StopIteration:
-                continue
-            
-            headers = [str(h) if h is not None else "" for h in first_row]
-            text_parts.append(f"[Sheet: {sheet_name}]")
-            
-            row_count = 0
-            for row in row_iter:
-                if row_count >= MAX_CSV_ROWS:
-                    text_parts.append(f"[... truncated at {MAX_CSV_ROWS} rows ...]")
-                    break
-                pairs = []
-                for h, v in zip(headers, row):
-                    if v is not None and str(v).strip():
-                        pairs.append(f"{h}: {v}")
-                if pairs:
-                    text_parts.append(", ".join(pairs))
-                row_count += 1
-        wb.close()
+        with pdfplumber.open(file_path) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text: full_text += text + "\n"
+                    
+            # Keep abstract as single chunk
+            abstract_match = re.search(r'(?i)\babstract\b.*?(?=\n1\.?\s+Introduction|\n\d+\.\s)', full_text, re.DOTALL)
+            if abstract_match:
+                chunks.append(f"[Abstract] {filename}:\n" + abstract_match.group(0).strip())
+                full_text = full_text.replace(abstract_match.group(0), "")
+                
+            # Split sections using numbering e.g. "1. Introduction"
+            sections = re.split(r'\n(?=\d+\.\s+[A-Z])', full_text)
+            for sec in sections:
+                if len(sec.strip()) < 50: continue
+                # 800-1200 tokens roughly translates to ~4000 characters. 
+                # Reduced to 2000 chars safely stay under local model token limit.
+                if len(sec) > 2500:
+                    subchunks = chunk_text(sec, chunk_size=2000, overlap=500)
+                    chunks.extend([f"[Excerpt] {filename}:\n" + sc for sc in subchunks])
+                else:
+                    chunks.append(f"[Section] {filename}:\n" + sec.strip())
     except Exception as e:
-        print(f"  XLSX read error: {e}")
-        return ""
-    
-    return "\n".join(text_parts)
-
+        print(f"  Paper extraction error: {e}")
+    return chunks
 
 # -----------------------------------------------------------------
-# UNIFIED INGESTION
+# ROUTING AND INGESTION
 # -----------------------------------------------------------------
-def extract_text(file_path: str, filename: str) -> str:
-    """Route to the correct text extractor based on file extension."""
+def extract_and_chunk(file_path: str, filename: str) -> list:
     ext = Path(filename).suffix.lower()
-    if ext == ".pdf":
-        return extract_text_from_pdf(file_path)
+    fname_lower = filename.lower()
+    
+    if ext == ".csv" and "govdata" in fname_lower:
+        return chunk_gov_csv(file_path, filename)
+    elif ext == ".pdf" and "govdata" in fname_lower:
+        return chunk_mixed_gov_pdf(file_path, filename)
+    elif ext == ".pdf" and ("lecture" in fname_lower or "lab" in fname_lower or "slide" in fname_lower):
+        return chunk_presentation(file_path, filename)
+    elif ext == ".pdf" and ("project" in fname_lower or "system" in fname_lower):
+        return chunk_report(file_path, filename)
+    elif ext == ".pdf":
+        return chunk_paper(file_path, filename)
     elif ext == ".csv":
-        return extract_text_from_csv(file_path)
-    elif ext in (".xlsx", ".xls"):
-        return extract_text_from_xlsx(file_path)
+        # Fallback csv read
+        return chunk_gov_csv(file_path, filename) # generic fallback for csv
     else:
-        print(f"  Unsupported file type: {ext}")
-        return ""
+        # Fallback text
+        with open(file_path, "r", errors="ignore") as f:
+            return chunk_text(f.read())
 
-
-def ingest_file(file_path: str, filename: str, client: httpx.Client = None) -> int:
-    """Reads any supported file, chunks it, embeds it, and saves to LanceDB."""
-    # Check file size
-    size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    if size_mb > MAX_INGEST_SIZE_MB:
-        print(f"  [SKIP] File too large ({size_mb:.1f} MB > {MAX_INGEST_SIZE_MB} MB): {filename}")
-        return 0
-    
-    full_text = extract_text(file_path, filename)
-    if not full_text or len(full_text.strip()) < 50:
-        print(f"  [SKIP] No meaningful text extracted from: {filename}")
-        return 0
-    
-    chunks = chunk_text(full_text)
-    if not chunks:
-        return 0
-    
-    # Prepare data array for LanceDB (must contain a 'vector' key)
-    successful_data = []
-    
-    # Process sequentially to avoid Ollama parallel batching panics.
-    # Re-using the persistent client with direct IP (127.0.0.1) keeps network overhead under 1ms, 
-    # achieving high speeds without triggering server failures.
-    for i, chunk in enumerate(chunks):
-        embedding = get_embedding(chunk, client=client)
-        if not embedding:
-            raise RuntimeError(f"Failed to embed chunk {i} for {filename} (empty embedding returned). skipping DB insertion to prevent partial ingestion.")
-        
-        successful_data.append({
-            "id": f"{filename}_chunk_{i}",
-            "vector": embedding,
-            "text": chunk,
-            "source": filename
-        })
-
-    # Insert into LanceDB
-    if TABLE_NAME in db.table_names():
-        # Open existing table and append new data
-        table = db.open_table(TABLE_NAME)
-        table.add(successful_data)
-    else:
-        # Create a new table automatically inferring the schema from the data
-        db.create_table(TABLE_NAME, data=successful_data)
-        
-    return len(successful_data)
-
-
-def ingest_pdf(file_path: str, filename: str) -> int:
-    """Legacy wrapper -- kept for backward compatibility with app.py."""
-    return ingest_file(file_path, filename)
-
-
-def retrieve_chunks(query: str, top_k: int = 6) -> list:
-    """Searches the LanceDB table for chunks that match the user's question."""
-    query_embedding = get_embedding(query)
-    
-    if not query_embedding:
-        return []
-
-    # Check if the table even exists yet (prevents crashes on empty DB)
-    if TABLE_NAME not in db.table_names():
-        return []
-
-    table = db.open_table(TABLE_NAME)
-    
-    # Execute LanceDB vector search
-    results = table.search(query_embedding).limit(top_k).to_list()
-    
-    # LanceDB returns the full row (id, vector, text, source). 
-    # We just need to extract the raw text to feed back to our LLM.
-    return [result["text"] for result in results]
-
-
-# -----------------------------------------------------------------
-# BULK INGESTION -- run with: python database.py
-# -----------------------------------------------------------------
 def get_ingested_sources() -> set:
-    """Return the set of source filenames already in the DB."""
     if TABLE_NAME not in db.table_names():
         return set()
     table = db.open_table(TABLE_NAME)
@@ -261,115 +238,96 @@ def get_ingested_sources() -> set:
     except Exception:
         return set()
 
-
 def ingest_all(data_dir: Path = DATA_DIR, force: bool = False):
-    """Walk the DATA directory and ingest every supported file into LanceDB.
+    supported_extensions = {".pdf", ".csv", ".txt"}
     
-    Args:
-        data_dir: Path to folder containing documents.
-        force: If True, re-ingest files that are already in the DB.
-    """
-    supported_extensions = {".pdf", ".csv", ".xlsx", ".xls"}
-    
-    files = sorted([
-        f for f in data_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in supported_extensions
-    ])
+    files = sorted([f for f in data_dir.iterdir() if f.is_file() and f.suffix.lower() in supported_extensions])
     
     if not files:
         print(f"No supported files found in {data_dir}")
         return
-    
-    # Check what's already ingested
+        
     already_ingested = set() if force else get_ingested_sources()
     
     print("=" * 60)
-    print("  LANCEDB BULK INGESTION")
+    print("  LANCEDB BATCH INGESTION (FILE-BY-FILE STREAMING)")
     print("=" * 60)
     print(f"  Data directory : {data_dir.resolve()}")
     print(f"  Files found    : {len(files)}")
     print(f"  Already in DB  : {len(already_ingested)}")
-    print(f"  Force re-ingest: {force}")
     print("=" * 60)
     
-    total_chunks = 0
-    ingested_count = 0
-    skipped_count = 0
-    failed_count = 0
+    total_inserted = 0
     start_time = time.time()
     
-    with httpx.Client(timeout=30.0) as client:
-        for i, filepath in enumerate(files, 1):
+    with httpx.Client(timeout=300.0) as client:
+        for filepath in files:
             filename = filepath.name
-            ext = filepath.suffix.lower()
             
-            # Skip already-ingested files
-            if filename in already_ingested:
-                print(f"\n[{i}/{len(files)}] [SKIP] Already ingested: {filename}")
-                skipped_count += 1
+            size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            if size_mb > MAX_INGEST_SIZE_MB:
+                print(f"\n[SKIP] File too large ({size_mb:.1f} MB > {MAX_INGEST_SIZE_MB} MB): {filename}")
                 continue
-            
-            print(f"\n[{i}/{len(files)}] [{ext.upper()[1:]}] Ingesting: {filename}", flush=True)
-            
-            try:
-                chunk_count = ingest_file(str(filepath), filename, client=client)
                 
-                if chunk_count > 0:
-                    print(f"  [OK] {chunk_count} chunks embedded and stored", flush=True)
-                    total_chunks += chunk_count
-                    ingested_count += 1
-                else:
-                    print(f"  [SKIP] No chunks produced", flush=True)
-                    skipped_count += 1
+            if filename in already_ingested:
+                print(f"\n[SKIP] Already ingested: {filename}")
+                continue
+                
+            print(f"\n[PROCESSING] Extracting & chunking: {filename} ({size_mb:.1f} MB)...")
+            chunks = extract_and_chunk(str(filepath), filename)
+            if not chunks:
+                print(f"  [WARN] No chunks extracted.")
+                continue
+                
+            print(f"  Extracted {len(chunks)} chunks. GPU embedding sequentially (extremely fast over local IP)...")
+            
+            # Fast sequential embedding (avoids Ollama parallel/batch panics and 500 errors)
+            file_inserted = 0
+            successful_data = []
+            
+            for i, chunk_text_str in enumerate(chunks):
+                if i > 0 and i % 50 == 0:
+                    print(f"    -> Embedded {i}/{len(chunks)}...", end="\r", flush=True)
                     
-            except Exception as e:
-                print(f"  [FAIL] {e}")
-                failed_count += 1
-    
+                emb = get_embedding(chunk_text_str, client=client)
+                if not emb:
+                    print(f"\n  [ERROR] Failed to embed chunk {i}. Stopping file.")
+                    break
+                    
+                successful_data.append({
+                    "id": f"{filename}_chunk_{i}",
+                    "vector": emb,
+                    "text": chunk_text_str,
+                    "source": filename
+                })
+                
+            if successful_data:
+                if TABLE_NAME in db.table_names():
+                    table = db.open_table(TABLE_NAME)
+                    table.add(successful_data)
+                else:
+                    db.create_table(TABLE_NAME, data=successful_data)
+                    
+                file_inserted = len(successful_data)
+                print(f"\n  [DONE] {file_inserted} chunks successfully inserted for {filename}.")
+                total_inserted += file_inserted
+            
     elapsed = time.time() - start_time
-    
-    # Final summary
     print("\n" + "=" * 60)
     print("  INGESTION COMPLETE")
     print("=" * 60)
-    print(f"  Ingested  : {ingested_count} files")
-    print(f"  Skipped   : {skipped_count} files")
-    print(f"  Failed    : {failed_count} files")
-    print(f"  Total chunks in this run: {total_chunks}")
+    print(f"  Total chunks inserted: {total_inserted}")
     print(f"  Time elapsed: {elapsed:.1f}s")
-    
-    # Show DB stats
-    if TABLE_NAME in db.table_names():
-        table = db.open_table(TABLE_NAME)
-        try:
-            row_count = table.count_rows()
-            print(f"  Total chunks in DB: {row_count}")
-        except Exception:
-            pass
-    
     print("=" * 60)
-
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="Ingest all documents from DATA/ into LanceDB"
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Re-ingest files even if they are already in the database"
-    )
-    parser.add_argument(
-        "--data-dir", type=str, default=None,
-        help="Override the data directory path (default: ./DATA)"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true", help="Re-ingest files")
     args = parser.parse_args()
     
-    data_dir = Path(args.data_dir) if args.data_dir else DATA_DIR
-    
-    if not data_dir.exists():
-        print(f"Data directory not found: {data_dir}")
+    if not DATA_DIR.exists():
+        print(f"Data directory not found: {DATA_DIR}")
         exit(1)
-    
-    ingest_all(data_dir=data_dir, force=args.force)
+        
+    ingest_all(force=args.force)
